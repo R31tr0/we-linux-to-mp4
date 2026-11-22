@@ -416,7 +416,8 @@ function renderSceneToVideo(
 
   const wallpaperDir = path.dirname(pkgPath);
   const engineBinaryPath = path.join(__dirname, 'bin', 'linux-wallpaperengine');
-  const outputVideo = 'output_scene.mp4';
+  const randomSuffix = Math.floor(Math.random() * 100000);
+  const outputVideo = `output_scene_${randomSuffix}.mp4`;
 
   console.log(`\nЗапускаю фоновый рендер для: ${wallpaperDir}`);
 
