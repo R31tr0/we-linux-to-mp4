@@ -1,6 +1,277 @@
 const fs = require('fs');
-const { spawn } = require('child_process');
+const os = require('os');
+const { spawn, spawnSync } = require('child_process');
 const path = require('path');
+
+// ---------------------------------------------------------------------------
+// Настройки
+// ---------------------------------------------------------------------------
+
+// Разрешения для режима Xvfb. Чем меньше, тем меньше работы у llvmpipe (рендер на CPU).
+const RESOLUTIONS = {
+  '1': { width: 1920, height: 1080, label: '1920x1080 (Full HD)' },
+  '2': { width: 1280, height: 720, label: '1280x720 (HD, заметно легче для CPU)' }
+};
+
+// Размер виртуального экрана в режиме Cage headless.
+// У headless-бэкенда wlroots размер по умолчанию 1920x1080; менять его без wlr-randr нельзя.
+const CAGE_SIZE = { width: 1920, height: 1080 };
+
+// Задержка перед стартом записи (секунды на запуск движка), мс
+const XVFB_START_DELAY = 4000;
+const CAGE_START_DELAY = 6000;
+
+// PCI-идентификаторы производителей (читаются из /sys/class/drm/*/device/vendor)
+const GPU_VENDOR_IDS = { amd: '0x1002', nvidia: '0x10de' };
+
+// ---------------------------------------------------------------------------
+// Вспомогательные функции
+// ---------------------------------------------------------------------------
+
+function commandExists(name) {
+  return spawnSync('sh', ['-c', `command -v ${name}`], { stdio: 'ignore' }).status === 0;
+}
+
+// Ищем render-устройство. Если указан vendor ('amd' | 'nvidia'), берём карту этого производителя
+// (важно, когда в системе две видеокарты, например iGPU и дискретная).
+function findRenderDevice(vendor) {
+  try {
+    const nodes = fs.readdirSync('/dev/dri').filter((n) => n.startsWith('renderD')).sort();
+    if (vendor && GPU_VENDOR_IDS[vendor]) {
+      for (const node of nodes) {
+        try {
+          const id = fs.readFileSync(`/sys/class/drm/${node}/device/vendor`, 'utf8').trim();
+          if (id === GPU_VENDOR_IDS[vendor]) return `/dev/dri/${node}`;
+        } catch (_) {}
+      }
+    }
+    if (nodes.length > 0) return `/dev/dri/${nodes[0]}`;
+  } catch (_) {}
+  return '/dev/dri/renderD128';
+}
+
+// Проверяем, что нужный энкодер вообще есть в установленном ffmpeg
+function ffmpegHasEncoder(name) {
+  const res = spawnSync('ffmpeg', ['-hide_banner', '-encoders'], { encoding: 'utf8' });
+  return res.status === 0 && new RegExp(`\\b${name}\\b`).test(res.stdout);
+}
+
+// Пробуем на крошечном тестовом кадре, работает ли конвертация цвета на GPU через scale_vaapi
+let vaapiGpuConvertCache = null;
+function vaapiGpuConvertWorks() {
+  if (vaapiGpuConvertCache !== null) return vaapiGpuConvertCache;
+  const res = spawnSync('ffmpeg', [
+    '-hide_banner', '-loglevel', 'error', '-y',
+    '-vaapi_device', findRenderDevice('amd'),
+    '-f', 'lavfi', '-i', 'color=c=black:s=256x256:r=1:d=1,format=bgr0',
+    '-vf', 'hwupload,scale_vaapi=format=nv12',
+    '-frames:v', '1',
+    '-c:v', 'h264_vaapi',
+    '-f', 'null', '-'
+  ], { stdio: 'ignore' });
+  vaapiGpuConvertCache = res.status === 0;
+  return vaapiGpuConvertCache;
+}
+
+function fileHasData(file) {
+  try {
+    return fs.statSync(file).size > 0;
+  } catch (_) {
+    return false;
+  }
+}
+
+// Находим сокет Wayland, который создал cage в приватной папке
+function findWaylandSocket(dir) {
+  try {
+    const sock = fs.readdirSync(dir).find((n) => n.startsWith('wayland-') && !n.endsWith('.lock'));
+    if (sock) return sock;
+  } catch (_) {}
+  return 'wayland-0';
+}
+
+// ---------------------------------------------------------------------------
+// Профили кодирования
+//   ffmpegInput / ffmpegOutput: аргументы для режима Xvfb (запись через ffmpeg x11grab)
+//   wfArgs: аргументы для режима Cage (запись через wf-recorder)
+// ---------------------------------------------------------------------------
+const CODEC_PROFILES = {
+  default: {
+    label: 'По умолчанию (libopenh264, CPU)',
+    encoder: 'libopenh264',
+    vendor: null,
+    ffmpegInput: () => [],
+    ffmpegOutput: () => ['-c:v', 'libopenh264', '-b:v', '8M', '-pix_fmt', 'yuv420p'],
+    wfArgs: () => ['-c', 'libopenh264', '-x', 'yuv420p', '-p', 'b=8M']
+  },
+  nvidia: {
+    label: 'NVIDIA (h264_nvenc, GPU)',
+    encoder: 'h264_nvenc',
+    vendor: 'nvidia',
+    ffmpegInput: () => [],
+    ffmpegOutput: () => [
+      '-c:v', 'h264_nvenc',
+      '-preset', 'p5', '-tune', 'hq',
+      '-rc', 'vbr', '-cq', '23', '-b:v', '0',
+      '-pix_fmt', 'yuv420p'
+    ],
+    wfArgs: () => [
+      '-c', 'h264_nvenc', '-x', 'yuv420p',
+      '-p', 'preset=p5', '-p', 'tune=hq', '-p', 'rc=vbr', '-p', 'cq=23', '-p', 'b=0'
+    ]
+  },
+  amd: {
+    label: 'AMD (h264_vaapi, GPU)',
+    encoder: 'h264_vaapi',
+    vendor: 'amd',
+    ffmpegInput: () => ['-vaapi_device', findRenderDevice('amd')],
+    ffmpegOutput: () => {
+      // Если драйвер умеет, конвертация bgr0 -> nv12 идёт на GPU, а не на CPU
+      const gpuConvert = vaapiGpuConvertWorks();
+      console.log(
+        gpuConvert
+          ? 'VAAPI: конвертация цвета выполняется на GPU.'
+          : 'VAAPI: конвертация цвета на GPU недоступна, использую CPU.'
+      );
+      return [
+        '-vf', gpuConvert ? 'hwupload,scale_vaapi=format=nv12' : 'format=nv12,hwupload',
+        '-c:v', 'h264_vaapi',
+        '-rc_mode', 'CQP', '-qp', '22'
+      ];
+    },
+    wfArgs: () => ['-c', 'h264_vaapi', '-d', findRenderDevice('amd'), '-p', 'qp=22']
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Способы рендера
+//   Каждая фабрика сразу запускает движок и возвращает сессию:
+//   { engine, startDelayMs, manualStop, startRecorder(), cleanup() }
+// ---------------------------------------------------------------------------
+
+// Способ 1: Xvfb. Работает везде, но OpenGL считается на CPU (llvmpipe).
+function createXvfbSession(ctx) {
+  const sizeStr = `${ctx.size.width}x${ctx.size.height}`;
+
+  const engineEnv = {
+    ...process.env,
+    XDG_SESSION_TYPE: 'x11',
+    LIBGL_ALWAYS_SOFTWARE: '1',
+    __GLX_VENDOR_LIBRARY_NAME: 'mesa'
+  };
+  delete engineEnv.WAYLAND_DISPLAY;
+
+  const engine = spawn('xvfb-run', [ // Запускаем движок через xvfb-run на виртуальном дисплее X11.
+    '-n', '99', // Номер виртуального дисплея.
+    '-s', `-screen 0 ${sizeStr}x24`, // Экран выбранного разрешения, глубина цвета 24 бита.
+    ctx.engineBinaryPath, // Путь к движку.
+    '--window', `0x0x${sizeStr}`, // Окно движка во весь экран.
+    '--fps', `${ctx.fps}`, // Частота кадров.
+    '--silent', // Без звука.
+    ctx.wallpaperDir // Папка с обоями.
+  ], { detached: true, stdio: 'inherit', env: engineEnv });
+
+  return {
+    engine,
+    startDelayMs: XVFB_START_DELAY,
+    manualStop: false, // ffmpeg сам остановится по -t
+    startRecorder() {
+      return spawn('ffmpeg', [
+        '-y', // Перезаписывать выходной файл.
+        ...ctx.profile.ffmpegInput(), // Для VAAPI: -vaapi_device ...
+        '-video_size', sizeStr, // Размер совпадает с экраном Xvfb.
+        '-framerate', `${ctx.fps}`,
+        '-f', 'x11grab', // Захват экрана через X11.
+        '-draw_mouse', '0', // Убираем курсор.
+        '-thread_queue_size', '512', // Буфер захвата, чтобы реже терять кадры.
+        '-i', ':99',
+        '-t', String(ctx.durationSec), // Ограничиваем длительность.
+        ...ctx.profile.ffmpegOutput(), // Кодек и параметры профиля.
+        ctx.outputVideo
+      ], { stdio: ['ignore', 'inherit', 'inherit'] });
+    },
+    cleanup() {}
+  };
+}
+
+// Способ 2: Cage (Wayland-композитор) в headless-режиме + wf-recorder.
+// Рендер идёт на настоящем GPU через EGL/GBM, захват и кодирование тоже на GPU.
+function createCageSession(ctx) {
+  const { width, height } = ctx.size;
+
+  // Приватная папка для сокета Wayland, чтобы не пересекаться с вашей реальной сессией
+  const runtimeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'we-wl-'));
+
+  const env = {
+    ...process.env,
+    XDG_RUNTIME_DIR: runtimeDir,
+    WLR_BACKENDS: 'headless', // Виртуальный выход без монитора.
+    WLR_HEADLESS_OUTPUTS: '1',
+    WLR_LIBINPUT_NO_DEVICES: '1', // Разрешаем старт без устройств ввода.
+    WLR_RENDERER: 'gles2'
+  };
+  delete env.DISPLAY;
+  delete env.WAYLAND_DISPLAY;
+  delete env.LIBGL_ALWAYS_SOFTWARE; // Никакого программного рендера.
+  if (ctx.profile.vendor) {
+    env.WLR_RENDER_DRM_DEVICE = findRenderDevice(ctx.profile.vendor);
+  }
+
+  const engine = spawn('cage', [
+    '--',
+    ctx.engineBinaryPath,
+    '--window', `0x0x${width}x${height}`,
+    '--fps', `${ctx.fps}`,
+    '--silent',
+    ctx.wallpaperDir
+  ], { detached: true, stdio: 'inherit', env });
+
+  return {
+    engine,
+    startDelayMs: CAGE_START_DELAY,
+    manualStop: true, // wf-recorder не знает про длительность, остановим сигналом SIGINT
+    startRecorder() {
+      const recEnv = {
+        ...process.env,
+        XDG_RUNTIME_DIR: runtimeDir,
+        WAYLAND_DISPLAY: findWaylandSocket(runtimeDir)
+      };
+      delete recEnv.DISPLAY;
+      return spawn('wf-recorder', [
+        '-y', // Перезаписывать выходной файл.
+        '-r', `${ctx.fps}`,
+        '-f', ctx.outputVideo,
+        ...ctx.profile.wfArgs()
+      ], { env: recEnv, stdio: ['ignore', 'inherit', 'inherit'] });
+    },
+    cleanup() {
+      try {
+        fs.rmSync(runtimeDir, { recursive: true, force: true });
+      } catch (_) {}
+    }
+  };
+}
+
+const BACKENDS = {
+  xvfb: {
+    label: 'Xvfb (рендер на CPU)',
+    requires: ['xvfb-run', 'ffmpeg'],
+    installHint: 'sudo dnf install xorg-x11-server-Xvfb',
+    size: (resolution) => resolution,
+    create: createXvfbSession
+  },
+  cage: {
+    label: 'Cage headless (рендер на GPU)',
+    requires: ['cage', 'wf-recorder'],
+    installHint: 'sudo dnf install cage wf-recorder',
+    size: () => CAGE_SIZE,
+    create: createCageSession
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Основной сценарий
+// ---------------------------------------------------------------------------
 
 function extractVideo(assets, pkgPath, readlineSync) {
   // 1. Сначала предлагаем вырезать готовые видео, ЕСЛИ они есть в архиве
@@ -66,13 +337,48 @@ function extractVideo(assets, pkgPath, readlineSync) {
       return;
     }
 
-    renderSceneToVideo(pkgPath, durationSec, fps);
+    const cageReady = BACKENDS.cage.requires.every(commandExists);
+    console.log('\nВыберите способ рендера:');
+    console.log('[1] Xvfb (рендер на CPU, работает везде)');
+    console.log(
+      `[2] Cage headless (рендер на GPU, экспериментально)${
+        cageReady ? '' : ' - не установлены cage и wf-recorder'
+      }`
+    );
+    const backendChoice = readlineSync.question('Номер (Enter = 1): ').trim();
+    const backendKey = backendChoice === '2' ? 'cage' : 'xvfb';
+
+    // Разрешение выбираем только для Xvfb; у Cage размер фиксированный
+    let resolution = RESOLUTIONS['1'];
+    if (backendKey === 'xvfb') {
+      console.log('\nВыберите разрешение записи:');
+      console.log(`[1] ${RESOLUTIONS['1'].label}`);
+      console.log(`[2] ${RESOLUTIONS['2'].label}`);
+      const resChoice = readlineSync.question('Номер (Enter = 1): ').trim();
+      resolution = RESOLUTIONS[resChoice] || RESOLUTIONS['1'];
+    }
+
+    console.log('\nВыберите кодек для записи:');
+    console.log('[1] По умолчанию (libopenh264, CPU)');
+    console.log('[2] NVIDIA (h264_nvenc)');
+    console.log('[3] AMD (h264_vaapi)');
+    const codecChoice = readlineSync.question('Номер (Enter = 1): ').trim();
+    const codecKey = { '2': 'nvidia', '3': 'amd' }[codecChoice] || 'default';
+
+    renderSceneToVideo(pkgPath, durationSec, fps, codecKey, backendKey, resolution);
   } else {
     console.log('Конвертация видео отменена пользователем.');
   }
 }
 
-function renderSceneToVideo(pkgPath, durationSec, fps) {
+function renderSceneToVideo(
+  pkgPath,
+  durationSec,
+  fps,
+  codecKey = 'default',
+  backendKey = 'xvfb',
+  resolution = RESOLUTIONS['1']
+) {
   if (!Number.isFinite(durationSec) || durationSec <= 0) {
     console.error('Ошибка: длительность должна быть положительным числом.');
     return;
@@ -82,28 +388,53 @@ function renderSceneToVideo(pkgPath, durationSec, fps) {
     return;
   }
 
+  // Выбираем способ рендера; если нужных программ нет, откатываемся на Xvfb
+  let backend = BACKENDS[backendKey] || BACKENDS.xvfb;
+  const missing = backend.requires.filter((cmd) => !commandExists(cmd));
+  if (missing.length > 0) {
+    console.warn(`Не найдено: ${missing.join(', ')}. Установка: ${backend.installHint}`);
+    if (backend !== BACKENDS.xvfb) {
+      console.warn('Использую Xvfb (рендер на CPU).');
+      backend = BACKENDS.xvfb;
+      resolution = RESOLUTIONS['1'];
+    } else {
+      return;
+    }
+  }
+
+  // Выбираем профиль кодека; если энкодера нет в ffmpeg, откатываемся на libopenh264
+  let profile = CODEC_PROFILES[codecKey] || CODEC_PROFILES.default;
+  if (!ffmpegHasEncoder(profile.encoder)) {
+    console.warn(`Энкодер ${profile.encoder} не найден в вашем ffmpeg, использую libopenh264.`);
+    profile = CODEC_PROFILES.default;
+  }
+
+  const size = backend.size(resolution);
+  console.log(`Рендер: ${backend.label}`);
+  console.log(`Кодек: ${profile.label}`);
+  console.log(`Разрешение: ${size.width}x${size.height}`);
+
   const wallpaperDir = path.dirname(pkgPath);
   const engineBinaryPath = path.join(__dirname, 'bin', 'linux-wallpaperengine');
   const outputVideo = 'output_scene.mp4';
 
   console.log(`\nЗапускаю фоновый рендер для: ${wallpaperDir}`);
 
-  const engineEnv = { ...process.env, XDG_SESSION_TYPE: 'x11', LIBGL_ALWAYS_SOFTWARE: '1',__GLX_VENDOR_LIBRARY_NAME: 'mesa' };
-  delete engineEnv.WAYLAND_DISPLAY;
+  const session = backend.create({
+    wallpaperDir,
+    engineBinaryPath,
+    fps,
+    durationSec,
+    size,
+    profile,
+    outputVideo
+  });
+  const engineProcess = session.engine;
 
-  const engineProcess = spawn('xvfb-run', [ // Запускаем движок через xvfb-run для работы на виртуальном дисплее X11.
-      '-n', '99', // Назначаем виртуальному дисплею номер 99.
-      '-s', '-screen 0 1920x1080x24', // Создаём один экран разрешением 1920x1080 и глубиной цвета 24 бита.
-      engineBinaryPath, // Указываем путь к исполняемому файлу движка.
-      '--window', '0x0x1920x1080', // Задаём движку окно размером 1920x1080 в позиции с координатами (0,0).
-      '--fps', `${fps}`, // Передаём движку частоту кадров из переменной fps.
-      '--silent', // Запускаем движок в тихом режиме без звука.
-      wallpaperDir // Передаём движку папку с обоями или файлами для воспроизведения.
-    ], { detached: true, stdio: 'inherit', env: engineEnv }); // Отделяем процесс от родительского и наследуем стандартные потоки ввода и вывода.
-
-  let ffmpegProcess;
+  let recorderProcess;
   let engineStartFailed = false;
   let recordingFinished = false;
+  let stoppedByUs = false;
 
   const stopEngine = () => {
     if (!engineProcess.pid) return;
@@ -118,61 +449,62 @@ function renderSceneToVideo(pkgPath, durationSec, fps) {
 
   engineProcess.once('error', (err) => {
     engineStartFailed = true;
-    console.error('Ошибка запуска xvfb-run или движка:', err.message);
+    console.error('Ошибка запуска движка или композитора:', err.message);
+    session.cleanup();
   });
 
   engineProcess.once('close', (code, signal) => {
-    if (!ffmpegProcess && !engineStartFailed) {
+    if (!recorderProcess && !engineStartFailed) {
       console.error(
         `Движок завершился до начала записи (код ${code}, сигнал ${signal || 'нет'}).`
       );
-    } else if (ffmpegProcess && !recordingFinished) {
-      console.error('Движок завершился во время записи; остановка ffmpeg.');
-      ffmpegProcess.kill('SIGTERM');
+      session.cleanup();
+    } else if (recorderProcess && !recordingFinished) {
+      console.error('Движок завершился во время записи; остановка рекордера.');
+      recorderProcess.kill(session.manualStop ? 'SIGINT' : 'SIGTERM');
     }
   });
 
   setTimeout(() => {
     if (engineStartFailed || engineProcess.exitCode !== null || engineProcess.signalCode !== null) {
       return;
-      
     }
 
     console.log(`Идет запись в фоне (${durationSec} сек)...`);
 
-    // Запускаем процесс ffmpeg для записи экрана.
-    ffmpegProcess = spawn('ffmpeg', [
-      '-y', // Перезаписывать выходной файл, если он уже существует.
-      '-video_size', '1920x1080', // Устанавливаем размер записываемого изображения: 1920 на 1080 пикселей.
-      '-framerate', `${fps}`, // Задаём частоту кадров записи из переменной fps.
-      '-f', 'x11grab', // Указываем ffmpeg использовать захват экрана через X11.
-      '-draw_mouse', '0', // убираем крест
-      '-i', ':99', // Захватываем экран дисплея :99
-      '-t', String(durationSec), // Ограничиваем длительность записи указанным количеством секунд.
-      '-c:v', 'libopenh264', // Кодируем видео с помощью видеокодека libopenh264.
-      '-b:v', '8M', // Устанавливаем целевой битрейт видео 8 Мбит/с.
-      '-pix_fmt', 'yuv420p', // Преобразуем пиксели в формат yuv420p для совместимости.
-      outputVideo // Указываем путь и имя создаваемого видеофайла.
-    ], { stdio: ['ignore', 'inherit', 'inherit'] }); // Не передаём ввод; выводим стандартные потоки ffmpeg в родительский процесс.
+    recorderProcess = session.startRecorder();
 
-    ffmpegProcess.once('error', (err) => {
-      console.error('Ошибка запуска ffmpeg:', err.message);
+    // wf-recorder не умеет ограничивать длительность сам, останавливаем его через SIGINT
+    if (session.manualStop) {
+      setTimeout(() => {
+        if (!recordingFinished) {
+          stoppedByUs = true;
+          recorderProcess.kill('SIGINT');
+        }
+      }, durationSec * 1000);
+    }
+
+    recorderProcess.once('error', (err) => {
+      console.error('Ошибка запуска рекордера:', err.message);
       recordingFinished = true;
       stopEngine();
+      session.cleanup();
     });
 
-    ffmpegProcess.once('close', (code, signal) => {
+    recorderProcess.once('close', (code, signal) => {
       recordingFinished = true;
-      if (code === 0) {
+      const ok = code === 0 || (stoppedByUs && fileHasData(outputVideo));
+      if (ok) {
         console.log(`\nГотово! Видео сохранено в файл: ${outputVideo}`);
       } else {
         console.error(
-          `Ошибка записи видео: ffmpeg завершился с кодом ${code}, сигнал ${signal || 'нет'}.`
+          `Ошибка записи видео: рекордер завершился с кодом ${code}, сигнал ${signal || 'нет'}.`
         );
       }
       stopEngine();
+      session.cleanup();
     });
-  }, 4000);
+  }, session.startDelayMs);
 }
 
 module.exports = extractVideo;
