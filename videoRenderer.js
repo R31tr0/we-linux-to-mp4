@@ -1,6 +1,10 @@
 const path = require('path');
+const fs = require('fs');
+const os = require('os');
+const { pipeline } = require('stream/promises');
 const BACKENDS = require('./videoBackends');
 const CODEC_PROFILES = require('./videoCodecs');
+const { execFileSync } = require('child_process');
 const {
   RESOLUTIONS,
   commandExists,
@@ -14,7 +18,9 @@ function renderSceneToVideo(
   fps,
   codecKey = 'default',
   backendKey = 'xvfb',
-  resolution = RESOLUTIONS['1']
+  resolution = RESOLUTIONS['1'],
+  videos = [],
+  readlineSync
 ) {
   if (!Number.isFinite(durationSec) || durationSec <= 0) {
     console.error('Ошибка: длительность должна быть положительным числом.');
@@ -56,6 +62,7 @@ function renderSceneToVideo(
 
   console.log(`\nЗапускаю фоновый рендер для: ${wallpaperDir}`);
 
+  let blendMode = 'lighten';
   const session = backend.create({
     wallpaperDir,
     engineBinaryPath,
@@ -80,6 +87,61 @@ function renderSceneToVideo(
       if (error.code !== 'ESRCH') {
         console.error('Не удалось остановить движок:', error.message);
       }
+    }
+  };
+
+  const renderWithLayer = async (video, inputVideo, outPath) => {
+    const extension = path.extname(video.name) || '.mp4';
+    const layerPath = path.join(
+      os.tmpdir(),
+      `we-linux-layer-${process.pid}-${Date.now()}-${Math.random()
+        .toString(16)
+        .slice(2)}${extension}`
+    );
+    try {
+      await pipeline(
+        fs.createReadStream(pkgPath, { start: video.start, end: video.end }),
+        fs.createWriteStream(layerPath)
+      );
+      const outputOptions = profile.ffmpegOutput();
+      const videoFilterIndex = outputOptions.indexOf('-vf');
+      const outputFilter =
+        videoFilterIndex === -1 ? null : outputOptions.splice(videoFilterIndex, 2)[1];
+      const filterGraph =
+      '[1:v][0:v]scale2ref=w=rw:h=rh[layer_scaled][base_raw];' +
+      '[base_raw]format=rgb24[base];' +
+      '[layer_scaled]format=rgb24[layer];' +
+      `[base][layer]blend=all_mode=${blendMode}:shortest=0,format=yuv420p[v]` +
+      (outputFilter ? `;[v]${outputFilter}[encoded]` : '');
+
+      execFileSync(
+        'ffmpeg',
+        [
+          '-y',
+          '-vaapi_device',
+          '/dev/dri/renderD128',
+          '-i',
+          inputVideo,
+          '-i',
+          layerPath,
+          '-filter_complex',
+          filterGraph,
+          '-map',
+          outputFilter ? '[encoded]' : '[v]',
+          '-map',
+          '0:a?',
+          '-t',
+          String(durationSec),
+          ...outputOptions,
+          '-c:a',
+          'copy',
+          outPath
+        ],
+        { stdio: 'inherit' }
+      );
+      console.log(`Готово! Видео со слоем сохранено в файл: ${outPath}`);
+    } finally {
+      await fs.promises.rm(layerPath, { force: true });
     }
   };
 
@@ -125,7 +187,7 @@ function renderSceneToVideo(
       session.cleanup();
     });
 
-    recorderProcess.once('close', (code, signal) => {
+    recorderProcess.once('close', async (code, signal) => {
       recordingFinished = true;
       const ok = code === 0 || (stoppedByUs && fileHasData(outputVideo));
       if (ok) {
@@ -136,6 +198,60 @@ function renderSceneToVideo(
         );
       }
       stopEngine();
+
+      if (ok && videos.length > 0 && readlineSync) {
+        const useLayer = readlineSync.question(
+          '\nВы хотите отрендерить сцену со слоем из архива? (y/n): '
+        );
+        const askaboutblend = readlineSync.question(
+          '\n каким методом наложить слои ? lighten (1) или softlight (2) результат может быть разным тестируйте в зависимости от обоев (lighten/softlight): '
+        );
+        if (askaboutblend === '2') {
+          blendMode = 'softlight';
+        }
+        if (useLayer.toLowerCase() === 'y') {
+          console.log('\nДоступные видеофайлы для слоёв:');
+          videos.forEach((file, index) => {
+            console.log(`[${index + 1}] ${file.name} (${file.sizeMB})`);
+          });
+
+          const choice = readlineSync.question(
+            '\nВведите номер видео для слоя (0 = применить все слои осторожно рендер всех слоев работает не лучшим образом лучше рендерить по 1 и 2 слоя ): '
+          ).trim();
+
+          if (!/^\d+$/.test(choice) || Number(choice) > videos.length) {
+            console.error('Ошибка: файла с таким номером нет в списке.');
+          } else if (Number(choice) === 0) {
+            let inputVideo = outputVideo;
+            for (const [index, video] of videos.entries()) {
+              const outPath = `layersoutput_${index + 1}.mp4`;
+              console.log(`Рендер слоя ${index + 1} из ${videos.length}...`);
+              try {
+                await renderWithLayer(video, inputVideo, outPath);
+                inputVideo = outPath;
+              } catch (error) {
+                console.error(
+                  `Ошибка при рендере слоя ${index + 1}:`,
+                  error.message
+                );
+                break;
+              }
+            }
+          } else {
+            const selectedVideo = videos[Number(choice) - 1];
+            console.log('Начинаю рендер слоя...');
+            try {
+              await renderWithLayer(
+                selectedVideo,
+                outputVideo,
+                'layersoutput.mp4'
+              );
+            } catch (error) {
+              console.error('Ошибка при рендере слоя:', error.message);
+            }
+          }
+        }
+      }
       session.cleanup();
     });
   }, session.startDelayMs);

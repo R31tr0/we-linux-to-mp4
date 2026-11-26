@@ -105,7 +105,16 @@ function extractVideo(assets, pkgPath, readlineSync) {
   const codecChoice = readlineSync.question('Номер (Enter = 1): ').trim();
   const codecKey = { '2': 'nvidia', '3': 'amd' }[codecChoice] || 'default';
 
-  renderSceneToVideo(pkgPath, durationSec, fps, codecKey, backendKey, resolution);
+  renderSceneToVideo(
+    pkgPath,
+    durationSec,
+    fps,
+    codecKey,
+    backendKey,
+    resolution,
+    assets.videos,
+    readlineSync
+  );
 }
 
 module.exports = extractVideo;
