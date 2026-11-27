@@ -1,5 +1,7 @@
 # Wallpaper Engine Scene to MP4
 
+![Full project demo](demo.gif)
+
 [![Platform](https://img.shields.io/badge/platform-Linux-informational?logo=linux)](https://www.kernel.org/)
 [![Node.js](https://img.shields.io/badge/Node.js-required-339933?logo=nodedotjs&logoColor=white)](https://nodejs.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
