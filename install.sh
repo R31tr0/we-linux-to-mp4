@@ -284,7 +284,7 @@ case "${response,,}" in
                 ;;
             arch|manjaro|endeavouros)
                 echo "Устанавливаем системные зависимости через pacman..."
-                run_as_root pacman -Sy --needed --noconfirm nodejs npm ffmpeg xorg-server-xvfb \
+                run_as_root pacman -S --needed --noconfirm nodejs npm ffmpeg xorg-server-xvfb \
                     base-devel cmake libxrandr libxinerama libxcursor libxi mesa glew \
                     freeglut sdl2 lz4 glm glfw mpv libpulse fftw freetype2
                 ;;

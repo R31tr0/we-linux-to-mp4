@@ -21,9 +21,20 @@ function createXvfbSession(ctx) {
   };
   delete engineEnv.WAYLAND_DISPLAY;
 
+  // Файл нужен, чтобы передать выбранный xvfb-run дисплей от движка к FFmpeg.
+  const displayFile = path.join(
+    os.tmpdir(),
+    `we-xvfb-display-${process.pid}-${Date.now()}`
+  );
   const engine = spawn('xvfb-run', [
-    '-n', '99',
+    '-a',
     '-s', `-screen 0 ${sizeStr}x24`,
+    // xvfb-run задаёт DISPLAY только дочернему процессу.
+    // Сохраняем его, затем запускаем движок вместо этой shell-обёртки.
+    'sh', '-c',
+    'printf "%s" "$DISPLAY" > "$1"; shift; exec "$@"',
+    'sh',
+    displayFile,
     ctx.engineBinaryPath,
     '--window', `0x0x${sizeStr}`,
     '--fps', `${ctx.fps}`,
@@ -36,6 +47,8 @@ function createXvfbSession(ctx) {
     startDelayMs: XVFB_START_DELAY,
     manualStop: false,
     startRecorder() {
+      // FFmpeg должен захватывать тот же дисплей, который выбрал xvfb-run.
+      const display = fs.readFileSync(displayFile, 'utf8').trim();
       return spawn('ffmpeg', [
         '-y',
         ...ctx.profile.ffmpegInput(),
@@ -44,13 +57,15 @@ function createXvfbSession(ctx) {
         '-f', 'x11grab',
         '-draw_mouse', '0',
         '-thread_queue_size', '512',
-        '-i', ':99',
+        '-i', display,
         '-t', String(ctx.durationSec),
         ...ctx.profile.ffmpegOutput(),
         ctx.outputVideo
       ], { stdio: ['ignore', 'inherit', 'inherit'] });
     },
-    cleanup() {}
+    cleanup() {
+      fs.rmSync(displayFile, { force: true });
+    }
   };
 }
 

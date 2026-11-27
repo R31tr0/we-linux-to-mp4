@@ -118,8 +118,7 @@ function renderSceneToVideo(
         'ffmpeg',
         [
           '-y',
-          '-vaapi_device',
-          '/dev/dri/renderD128',
+          ...profile.ffmpegInput(),
           '-i',
           inputVideo,
           '-i',
@@ -144,15 +143,17 @@ function renderSceneToVideo(
       await fs.promises.rm(layerPath, { force: true });
     }
   };
-
+  let startimer;
   engineProcess.once('error', (error) => {
+    clearTimeout(startimer);
     engineStartFailed = true;
     console.error('Ошибка запуска движка или композитора:', error.message);
     session.cleanup();
   });
-
+  
   engineProcess.once('close', (code, signal) => {
     if (!recorderProcess && !engineStartFailed) {
+      clearTimeout(startimer);
       console.error(
         `Движок завершился до начала записи (код ${code}, сигнал ${signal || 'нет'}).`
       );
@@ -162,8 +163,8 @@ function renderSceneToVideo(
       recorderProcess.kill(session.manualStop ? 'SIGINT' : 'SIGTERM');
     }
   });
-
-  setTimeout(() => {
+  
+  startimer = setTimeout(() => {
     if (engineStartFailed || engineProcess.exitCode !== null || engineProcess.signalCode !== null) {
       return;
     }

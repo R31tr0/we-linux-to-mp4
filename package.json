@@ -1,8 +1,14 @@
 {
-  "name": "pkgextracter",
+  "name": "we-linux-to-mp4",
   "version": "1.0.0",
-  "description": "",
+  "description": "Render Wallpaper Engine scenes to MP4 on Linux and extract embedded videos.",
   "main": "index.js",
+  "bin": {
+    "we-linux-to-mp4": "./index.js"
+  },
+  "engines": {
+    "node": ">=14.14.0"
+  },
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },

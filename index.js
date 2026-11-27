@@ -1,5 +1,7 @@
+#!/usr/bin/env node
 // база
 const fs = require('fs');
+const path = require('path');
 const readlineSync = require('readline-sync');
 const classifyAssets = require('./assetClassifier');
 const printAssetMap = require('./assetMap');
@@ -21,14 +23,21 @@ if (choice1 === 0) {
 
 console.log(welcomeMessage);
 const pkgPath = readlineSync.question('По какому пути лежит ваш файл? ');
+
+if (path.extname(pkgPath).toLowerCase() !== '.pkg') {
+  console.error('Ошибка: указанный файл не является .pkg сценой.');
+  process.exit(1);
+}
+
 const fd = fs.openSync(pkgPath, 'r');
+
 
 let cursor = 0;
 const intBuffer = Buffer.alloc(4);
 
 // 1 блок: версия
 fs.readSync(fd, intBuffer, 0, 4, cursor);
-const versionlength = intBuffer.readInt32LE(0);
+const versionlength = intBuffer.readUInt32LE(0);
 cursor += 4;
 
 const versionBuffer = Buffer.alloc(versionlength);
@@ -40,7 +49,7 @@ console.log('Версия архива:', version);
 
 // 2 блок: общее количество файлов
 fs.readSync(fd, intBuffer, 0, 4, cursor);
-const filecount = intBuffer.readInt32LE(0);
+const filecount = intBuffer.readUInt32LE(0);
 cursor += 4;
 
 console.log('Всего файлов:', filecount);
@@ -50,7 +59,7 @@ const files = [];
 
 for (let i = 0; i < filecount; i++) {
   fs.readSync(fd, intBuffer, 0, 4, cursor);
-  const filenamesize = intBuffer.readInt32LE(0);
+  const filenamesize = intBuffer.readUInt32LE(0);
   cursor += 4;
 
   const filenameBuffer = Buffer.alloc(filenamesize);
@@ -59,11 +68,11 @@ for (let i = 0; i < filecount; i++) {
   cursor += filenamesize;
   console.log(`Файл ${i + 1}: ${name}`); 
   fs.readSync(fd, intBuffer, 0, 4, cursor);
-  const offset = intBuffer.readInt32LE(0);
+  const offset = intBuffer.readUInt32LE(0);
   cursor += 4;
 
   fs.readSync(fd, intBuffer, 0, 4, cursor);
-  const size = intBuffer.readInt32LE(0);
+  const size = intBuffer.readUInt32LE(0);
   cursor += 4;
 
   files.push({ name, offset, size });
