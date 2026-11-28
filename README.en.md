@@ -81,6 +81,33 @@ Extracted videos are saved in the current directory using their archive filename
 
 If recording starts with a black frame but the wallpaper appears later, try manually increasing `XVFB_START_DELAY` or `CAGE_START_DELAY` in `videoSupport.js`. Values are in milliseconds; for example, `10000` means 10 seconds. This will not fix a black screen caused by an unsupported scene or an engine error.
 
+> **Warning:** The `scale2ref is deprecated` log message can be ignored; it does not affect the rendering result.
+
+### Command-line flags
+
+| Flag | Action |
+| --- | --- |
+| `--input <scene.pkg>` | Set the scene path without the interactive prompt |
+| `--skip-readme` | Skip the readme prompt |
+| `--verbose` | Display detailed asset names and sizes |
+| `--help` | Display flags and usage examples |
+| `--extract <N>` | Extract the Nth video and exit |
+| `--render` | Render immediately without the render prompt |
+| `--duration <sec>` | Set recording duration |
+| `--fps <number>` | Set recording FPS |
+| `--backend xvfb\|cage` | Select the rendering backend |
+| `--resolution <name>` | Select `1920x1080` or `1280x720` |
+| `--codec <name>` | Select `default`, `nvidia`, or `amd` |
+| `--out <file.mp4>` | Set the output filename |
+
+```bash
+node index.js --input scene.pkg --skip-readme --render --duration 10 --fps 60 --backend xvfb --resolution 1920x1080 --codec default --out result.mp4
+node index.js --input scene.pkg --skip-readme --extract 1 --out video.mp4
+node index.js --help
+```
+
+Without `--verbose`, the asset map shows category counts. With `--verbose`, it displays names and sizes.
+
 ## Compatibility and limitations
 
 Rendering is performed by [`linux-wallpaperengine`](https://github.com/Almamu/linux-wallpaperengine), so compatibility depends on the features supported by that engine. This project does not replace the engine and cannot guarantee accurate rendering of every scene or support on every platform.

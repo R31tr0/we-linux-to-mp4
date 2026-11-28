@@ -20,7 +20,8 @@ function renderSceneToVideo(
   backendKey = 'xvfb',
   resolution = RESOLUTIONS['1'],
   videos = [],
-  readlineSync
+  readlineSync,
+  outputName = null
 ) {
   if (!Number.isFinite(durationSec) || durationSec <= 0) {
     console.error('Ошибка: длительность должна быть положительным числом.');
@@ -58,7 +59,7 @@ function renderSceneToVideo(
   const wallpaperDir = path.dirname(pkgPath);
   const engineBinaryPath = path.join(__dirname, 'bin', 'linux-wallpaperengine');
   const randomSuffix = Math.floor(Math.random() * 100000);
-  const outputVideo = `output_scene_${randomSuffix}.mp4`;
+  const outputVideo = outputName || `output_scene_${randomSuffix}.mp4`;
 
   console.log(`\nЗапускаю фоновый рендер для: ${wallpaperDir}`);
 
@@ -204,18 +205,18 @@ function renderSceneToVideo(
         const useLayer = readlineSync.question(
           '\nВы хотите отрендерить сцену со слоем из архива? (y/n): '
         );
-        const askaboutblend = readlineSync.question(
-          '\n каким методом наложить слои ? lighten (1) или softlight (2) результат может быть разным тестируйте в зависимости от обоев (lighten/softlight): '
-        );
-        if (askaboutblend === '2') {
-          blendMode = 'softlight';
-        }
+       
         if (useLayer.toLowerCase() === 'y') {
           console.log('\nДоступные видеофайлы для слоёв:');
           videos.forEach((file, index) => {
             console.log(`[${index + 1}] ${file.name} (${file.sizeMB})`);
           });
-
+           const askaboutblend = readlineSync.question(
+          '\n каким методом наложить слои ? lighten (1) или softlight (2) результат может быть разным тестируйте в зависимости от обоев (lighten/softlight): '
+        );
+        if (askaboutblend === '2') {
+          blendMode = 'softlight';
+        }
           const choice = readlineSync.question(
             '\nВведите номер видео для слоя (0 = применить все слои осторожно рендер всех слоев работает не лучшим образом лучше рендерить по 1 и 2 слоя ): '
           ).trim();
