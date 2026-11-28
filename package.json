@@ -1,6 +1,6 @@
 {
   "name": "we-linux-to-mp4",
-  "version": "1.0.0",
+  "version": "2.3.1",
   "description": "Render Wallpaper Engine scenes to MP4 on Linux and extract embedded videos.",
   "main": "index.js",
   "bin": {
